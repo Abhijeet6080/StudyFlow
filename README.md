@@ -129,3 +129,19 @@ npx expo start
 1. **Preloaded Demo Data**: The app comes pre-seeded with sample college courses (Data Structures, Operating Systems, Linear Algebra, Web Engineering), tasks with various due dates, upcoming exams, and study logs.
 2. **Reset Demo Data**: Navigate to **Profile** -> tap **"Reload Sample College Data"** at any time to restore the complete demo state.
 3. **Dark Mode**: Tap the sun/moon icon in the dashboard header or toggle the switch in the **Profile** screen.
+
+
+## 📥 Android APK
+
+Download and install the latest StudyFlow Android APK:
+
+[Download StudyFlow APK](https://drive.google.com/file/d/1w5ey7c-WzP8G8QX12pI8Pas9UEIkbvAM/view?usp=drivesdk)
+
+> The APK is provided for evaluation and demonstration purposes.
+
+
+
+## 🔗 Project Links
+
+- **GitHub Repository:** https://github.com/Abhijeet6080/StudyFlow
+- **Android APK:** https://drive.google.com/file/d/1w5ey7c-WzP8G8QX12pI8Pas9UEIkbvAM/view?usp=drivesdk
