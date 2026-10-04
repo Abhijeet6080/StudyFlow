@@ -1,14 +1,72 @@
+/**
+ * ModalWrapper.js — bottom-sheet modal with correct per-platform keyboard handling.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * DIAGNOSIS HISTORY
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * ORIGINAL BUG (keyboard overlapping form):
+ *   KeyboardAvoidingView inside a Modal has zero effect on Android because
+ *   the mechanism it relies on (window-layout-change events) does not fire
+ *   inside a Modal Dialog on Android. The keyboard literally overlaid the form.
+ *
+ * FIX ATTEMPT 1 (paddingBottom on backdrop + maxHeight:'70%'):
+ *   Bug A — %-based maxHeight is computed against the parent's CONTENT height
+ *     (total minus padding). paddingBottom:302 shrank backdrop content height
+ *     from 914→612dp. 70%×612 = 428dp → modal too small.
+ *   Bug B — ScrollView had no flex:1, so it had no bounded height and
+ *     couldn't scroll; content was just clipped.
+ *
+ * FIX ATTEMPT 2 (marginBottom:kbHeight + maxHeight = screenH - kbH - insets - 12):
+ *   NEW BUG — double-counting the keyboard offset.
+ *
+ *   On Android (Expo SDK 50+ / RN 0.73+), the Modal Dialog window is set to
+ *   SOFT_INPUT_ADJUST_RESIZE. When the keyboard opens the OS physically SHRINKS
+ *   the Dialog window. Two consequences:
+ *
+ *     (a) useWindowDimensions().height ALREADY returns the REDUCED height
+ *         (e.g., 914 → 612dp). Subtracting kbHeight again:
+ *         612 - 302 - 24 - 12 = 274dp → absurdly small modal → clipped form.
+ *
+ *     (b) The backdrop (flex:1) already fills the shrunken window, so the card
+ *         (justifyContent:'flex-end') is ALREADY sitting above the keyboard.
+ *         Adding marginBottom:kbHeight pushes it ANOTHER 302dp upward inside a
+ *         612dp window → bottom of card is at 612-302 = 310dp from window-top,
+ *         keyboard starts at 612dp → gap of 302dp between card and keyboard.
+ *
+ *   This is exactly the reported symptom: "modal mid/top of screen, huge empty
+ *   gap, form severely clipped."
+ *
+ * CORRECT FIX (this file):
+ *   Android: The OS already lifts the card above the keyboard. Do NOT apply
+ *     marginBottom or subtract kbHeight from the maxHeight. Simply use the
+ *     maxHeight prop (default 85%) against the already-adjusted screenHeight
+ *     returned by useWindowDimensions(). flex:1 on the ScrollView enables
+ *     proper scrolling within the bounded card.
+ *
+ *   iOS: The Modal window does NOT resize. Apply marginBottom:kbHeight to lift
+ *     the card, and compute maxHeight as screenHeight - kbHeight - insets.top.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * DIAGNOSTIC LOGGING (TEMPORARY — remove after verification)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *   Set ENABLE_DIAGNOSTICS = true to print runtime measurements to the Metro
+ *   console. Read the values in the terminal while running `npx expo start`.
+ *   Once verified, set back to false (or remove the block).
+ */
+
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  Dimensions,
+  Keyboard,
   Modal,
-  View,
-  Text,
-  StyleSheet,
-  TouchableOpacity,
   Platform,
   ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
   TouchableWithoutFeedback,
-  Keyboard,
+  View,
   useWindowDimensions,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -16,42 +74,10 @@ import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../context/ThemeContext';
 import { SPACING, RADIUS, TYPOGRAPHY } from '../../constants/theme';
 
-/**
- * ModalWrapper — bottom-sheet modal with reliable Android keyboard handling.
- *
- * ─── WHY KeyboardAvoidingView DOES NOT WORK INSIDE A MODAL ON ANDROID ────────
- * React Native's <Modal> on Android creates a separate Android Dialog window.
- * The Dialog's soft-input mode defaults to SOFT_INPUT_ADJUST_NOTHING, so Android
- * never resizes or repositions the Dialog when the keyboard appears.
- * KeyboardAvoidingView listens to window-layout-change events that never fire
- * inside a Dialog, so it produces zero adjustment regardless of `behavior` value.
- *
- * ─── PREVIOUS FIX AND WHY IT BROKE LAYOUT ────────────────────────────────────
- * The previous attempt added `paddingBottom: kbHeight` to the backdrop and
- * `maxHeight: '70%'` when the keyboard was open. This had two compounding bugs:
- *
- *   1. In React Native, %-based maxHeight is computed against the PARENT'S
- *      CONTENT HEIGHT (total height minus padding). Adding `paddingBottom:302`
- *      reduces the backdrop's content height from 914dp to 612dp. Then
- *      `maxHeight: '70%' = 0.70 × 612 = 428dp` — far too small for the form.
- *
- *   2. The ScrollView's `body` style had no `flex:1`. Without a bounded height
- *      on the ScrollView itself, React Native cannot enable scrolling — the
- *      content is simply clipped at the parent's maxHeight with no scroll handle.
- *      Result: only the top fragment of the first input was visible.
- *
- * ─── CORRECT APPROACH ────────────────────────────────────────────────────────
- * • Keep the backdrop full-screen (no paddingBottom — this was the source of
- *   the compression bug).
- * • Apply `marginBottom: kbHeight` to the MODAL CARD instead. With the backdrop
- *   using justifyContent:'flex-end', the card is bottom-aligned; marginBottom
- *   lifts its bottom edge to sit exactly on top of the keyboard.
- * • Compute `maxHeight` from real screen dimensions (useWindowDimensions) plus
- *   the safe-area top inset, so the card can never overflow above the status bar
- *   and always uses the maximum available space between safe-area and keyboard.
- * • Add `flex:1` to the ScrollView so it expands to fill the remaining height
- *   inside the bounded modal card and becomes properly scrollable.
- */
+// ─── Toggle this to print runtime dimension measurements to Metro console ─────
+const ENABLE_DIAGNOSTICS = true;
+// ─────────────────────────────────────────────────────────────────────────────
+
 export const ModalWrapper = ({
   visible,
   onClose,
@@ -62,63 +88,91 @@ export const ModalWrapper = ({
   maxHeight = '85%',
 }) => {
   const { theme } = useTheme();
+
+  // useWindowDimensions() is reactive: on Android it returns the REDUCED height
+  // when the keyboard is open (because the Dialog window resized). On iOS it
+  // returns the full screen height regardless of keyboard state.
   const { height: screenHeight } = useWindowDimensions();
   const insets = useSafeAreaInsets();
   const scrollRef = useRef(null);
+
+  // kbHeight is only used on iOS (Android relies on window resize).
   const [kbHeight, setKbHeight] = useState(0);
 
   useEffect(() => {
-    // keyboardWillShow fires before the keyboard appears on iOS (smoother).
-    // On Android only keyboardDidShow is reliable; Will* events do not fire.
+    // ── iOS: 'will' events fire before the keyboard animates in → smoother.
+    // ── Android: 'did' events are reliable; 'will' events never fire.
     const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
     const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
 
     const showSub = Keyboard.addListener(showEvent, (e) => {
-      setKbHeight(e.endCoordinates.height);
+      const kbH = e.endCoordinates.height;
+      setKbHeight(kbH);
+
+      if (ENABLE_DIAGNOSTICS) {
+        const winDim = Dimensions.get('window');
+        const scrDim = Dimensions.get('screen');
+        console.log('\n╔══════════ [ModalWrapper DIAGNOSTIC] keyboard OPEN ══════════');
+        console.log('║  platform                    :', Platform.OS);
+        console.log('║  e.endCoordinates.height     :', kbH.toFixed(1), 'dp  (keyboard height from event)');
+        console.log('║  Dimensions.get(window).h    :', winDim.height.toFixed(1), 'dp  (may already be reduced on Android)');
+        console.log('║  Dimensions.get(screen).h    :', scrDim.height.toFixed(1), 'dp  (always full physical screen)');
+        console.log('║  useWindowDimensions().h     :', screenHeight.toFixed(1), 'dp  (captured before this render cycle)');
+        console.log('║  insets.top                  :', insets.top.toFixed(1), 'dp');
+        console.log('╚═════════════════════════════════════════════════════════════\n');
+      }
     });
+
     const hideSub = Keyboard.addListener(hideEvent, () => {
       setKbHeight(0);
+      if (ENABLE_DIAGNOSTICS) {
+        const winDim = Dimensions.get('window');
+        console.log('\n╔══════════ [ModalWrapper DIAGNOSTIC] keyboard CLOSED ════════');
+        console.log('║  Dimensions.get(window).h    :', winDim.height.toFixed(1), 'dp  (should be restored to full)');
+        console.log('╚═════════════════════════════════════════════════════════════\n');
+      }
     });
 
     return () => {
       showSub.remove();
       hideSub.remove();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Reset keyboard height when the modal is dismissed.
+  // Reset when modal closes.
   useEffect(() => {
     if (!visible) setKbHeight(0);
   }, [visible]);
 
-  // ── Modal card max-height calculation ──────────────────────────────────────
+  // ── maxHeight calculation ──────────────────────────────────────────────────
   //
-  // When keyboard is CLOSED:
-  //   Use the `maxHeight` prop (default '85%' of screen height).
-  //   This is identical to the original design — no visual change.
+  // ANDROID:
+  //   useWindowDimensions().height is already the keyboard-adjusted height
+  //   (the OS shrank the Dialog window). We simply cap at maxHeight% of
+  //   screenHeight — no kbHeight subtraction needed or correct here.
+  //   marginBottom on the card = 0 (card is already above the keyboard).
   //
-  // When keyboard is OPEN:
-  //   The available vertical space is:
-  //     screenHeight  (full screen, backdrop is flex:1)
-  //     - kbHeight    (keyboard occupies bottom portion)
-  //     - insets.top  (safe-area/status-bar at the top)
-  //     - 12          (breathing gap so card doesn't touch the status bar)
+  // iOS:
+  //   useWindowDimensions().height is always the full screen height.
+  //   We must manually compute the available space: screenHeight - kbHeight.
+  //   marginBottom:kbHeight lifts the card above the keyboard.
   //
-  //   This guarantees the card fills every available pixel above the keyboard
-  //   without overflowing behind the status bar, regardless of device or
-  //   keyboard size.
-  //
-  // NOTE: Do NOT subtract kbHeight from the backdrop (paddingBottom) — that
-  //       was the bug. The backdrop stays full-screen; only marginBottom on the
-  //       card changes to lift it above the keyboard.
+  const baseMaxHeight = (() => {
+    if (typeof maxHeight === 'string' && maxHeight.endsWith('%')) {
+      return screenHeight * (parseFloat(maxHeight) / 100);
+    }
+    if (typeof maxHeight === 'number') return maxHeight;
+    return screenHeight * 0.85;
+  })();
+
   const resolvedMaxHeight =
-    kbHeight > 0
-      ? screenHeight - kbHeight - insets.top - 12
-      : typeof maxHeight === 'string' && maxHeight.endsWith('%')
-      ? screenHeight * (parseFloat(maxHeight) / 100)
-      : typeof maxHeight === 'number'
-      ? maxHeight
-      : screenHeight * 0.85;
+    Platform.OS === 'ios' && kbHeight > 0
+      ? screenHeight - kbHeight - insets.top - 8
+      : baseMaxHeight;
+
+  // Only iOS needs to manually push the card above the keyboard.
+  const cardMarginBottom = Platform.OS === 'ios' ? kbHeight : 0;
 
   return (
     <Modal
@@ -128,15 +182,14 @@ export const ModalWrapper = ({
       onRequestClose={onClose}
     >
       {/*
-        Backdrop: full-screen overlay, card anchored to bottom.
-        NO paddingBottom here — that was causing the compression bug.
-        The backdrop must stay flex:1 at full height so that the %-based
-        max-height on the card calculates against the full screen height.
+        Backdrop: full available window, card anchored to bottom.
+        On Android, when keyboard opens the OS shrinks the Dialog window so
+        this backdrop automatically becomes shorter — no extra adjustment needed.
       */}
       <TouchableWithoutFeedback onPress={onClose}>
         <View style={styles.backdrop}>
 
-          {/* Prevent backdrop-tap from closing when touching the card. */}
+          {/* Prevent card touches from bubbling to the backdrop dismiss handler. */}
           <TouchableWithoutFeedback>
             <View
               style={[
@@ -145,15 +198,20 @@ export const ModalWrapper = ({
                   backgroundColor: theme.card,
                   borderColor: theme.border,
                   maxHeight: resolvedMaxHeight,
-                  // marginBottom lifts the card's bottom edge above the keyboard.
-                  // With justifyContent:'flex-end' on the backdrop, the card is
-                  // bottom-aligned. Adding marginBottom:kbHeight shifts it upward
-                  // by exactly the keyboard height — no gap, no overlap.
-                  marginBottom: kbHeight,
+                  // iOS only: push card above keyboard.
+                  // Android: leave at 0 — OS already handles it.
+                  marginBottom: cardMarginBottom,
                 },
               ]}
+              onLayout={(e) => {
+                if (ENABLE_DIAGNOSTICS) {
+                  const { x, y, width, height } = e.nativeEvent.layout;
+                  console.log('[ModalWrapper DIAGNOSTIC] card onLayout →',
+                    `x:${x.toFixed(0)} y:${y.toFixed(0)} w:${width.toFixed(0)} h:${height.toFixed(0)}`);
+                }
+              }}
             >
-              {/* ── Drag Handle ─────────────────────────────────────────────── */}
+              {/* ── Drag Handle ─────────────────────────────────────────── */}
               <View style={styles.handleContainer}>
                 <View
                   style={[
@@ -163,7 +221,7 @@ export const ModalWrapper = ({
                 />
               </View>
 
-              {/* ── Header ──────────────────────────────────────────────────── */}
+              {/* ── Header ──────────────────────────────────────────────── */}
               <View style={[styles.header, { borderBottomColor: theme.border }]}>
                 <View style={styles.headerTitleContainer}>
                   <Text style={[styles.title, { color: theme.text }]}>{title}</Text>
@@ -177,10 +235,7 @@ export const ModalWrapper = ({
                 <TouchableOpacity
                   style={[
                     styles.closeBtn,
-                    {
-                      backgroundColor: theme.cardAlt,
-                      borderColor: theme.border,
-                    },
+                    { backgroundColor: theme.cardAlt, borderColor: theme.border },
                   ]}
                   onPress={onClose}
                   hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
@@ -189,19 +244,12 @@ export const ModalWrapper = ({
                 </TouchableOpacity>
               </View>
 
-              {/* ── Scrollable Body ─────────────────────────────────────────── */}
+              {/* ── Scrollable Body ─────────────────────────────────────── */}
               {/*
-                flex:1 is CRITICAL here. Without it, React Native does not give
-                the ScrollView a bounded height, so the content is only clipped
-                (not scrollable). With flex:1, the ScrollView expands to fill the
-                remaining space inside the max-height-bounded modal card, making
-                all inputs reachable via scroll.
-
-                keyboardShouldPersistTaps="handled" keeps the keyboard open when
-                the user taps another input or a non-keyboard-dismissing element.
-
-                keyboardDismissMode="on-drag" lets the user swipe down to dismiss
-                the keyboard without closing the modal.
+                flex:1 gives the ScrollView a bounded height so React Native
+                can calculate the scroll range. Without flex:1 the ScrollView
+                tries to be as tall as its content, the parent clips it, but
+                no scroll handle is created → content invisible and unreachable.
               */}
               <ScrollView
                 ref={scrollRef}
@@ -214,7 +262,7 @@ export const ModalWrapper = ({
                 {children}
               </ScrollView>
 
-              {/* ── Sticky Footer ────────────────────────────────────────────── */}
+              {/* ── Sticky Footer ────────────────────────────────────────── */}
               {footer ? (
                 <View style={[styles.footer, { borderTopColor: theme.border }]}>
                   {footer}
@@ -240,8 +288,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderBottomWidth: 0,
     width: '100%',
-    // No height or flex here — the card sizes itself from content, bounded
-    // by maxHeight (which is computed dynamically in the component body).
   },
   handleContainer: {
     alignItems: 'center',
@@ -281,10 +327,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   body: {
-    // flex:1 makes the ScrollView fill the remaining vertical space inside the
-    // modal card after the handle, header, and footer have taken their fixed
-    // heights. This is what enables actual scrolling when content overflows.
-    flex: 1,
+    flex: 1,                        // CRITICAL: enables bounded ScrollView height
     paddingHorizontal: SPACING.lg,
   },
   scrollContent: {
